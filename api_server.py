@@ -8,6 +8,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from model import GPTConfig, GPT
 import numpy as np
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 app = Flask(__name__)
 CORS(app)
@@ -18,6 +19,10 @@ encode = None
 decode = None
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
+
+# Global variables for Hugging Face model
+hf_model = None
+hf_tokenizer = None
 
 def load_model(model_path=None, model_type=None):
     """
@@ -78,6 +83,29 @@ def load_model(model_path=None, model_type=None):
     model.eval()
     model.to(device)
     print("Model loaded successfully")
+
+def load_falcon_model(quantize=True):
+    """
+    Load Falcon model that doesn't require authentication
+    """
+    global hf_model, hf_tokenizer
+    
+    model_name = "tiiuae/falcon-7b-instruct"
+    print(f"Loading Falcon model: {model_name}")
+    
+    # Load tokenizer
+    hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
+    
+    # Load model with quantization
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        load_in_8bit=True if quantize else False,
+        torch_dtype=torch.float16,
+    )
+    
+    print(f"{model_name} model loaded successfully")
+    return True
 
 @app.route('/api/generate', methods=['POST'])
 def generate_text():
@@ -356,9 +384,87 @@ def api_load_model():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# Store conversation history
+conversations = {}
+
+@app.route('/api/mixtral/chat', methods=['POST'])
+def mixtral_chat():
+    """
+    Chatbot endpoint using Falcon
+    """
+    global hf_model, hf_tokenizer
+    
+    # Load model if not already loaded
+    if hf_model is None or hf_tokenizer is None:
+        try:
+            load_falcon_model()
+        except Exception as e:
+            return jsonify({"error": f"Failed to load model: {str(e)}"}), 500
+    
+    data = request.json
+    user_message = data.get('message', '')
+    conversation_id = data.get('conversation_id', None)
+    max_tokens = data.get('max_tokens', 1024)
+    temperature = data.get('temperature', 0.7)
+    
+    # Get or create conversation history
+    if conversation_id and conversation_id in conversations:
+        history = conversations[conversation_id]
+    else:
+        import uuid
+        conversation_id = str(uuid.uuid4())
+        history = []
+        conversations[conversation_id] = history
+    
+    # Format conversation in Falcon's expected format
+    prompt = "You are a helpful assistant.\n\n"
+    for entry in history:
+        prompt += f"User: {entry['user']}\nAssistant: {entry['assistant']}\n\n"
+    
+    prompt += f"User: {user_message}\nAssistant:"
+    
+    try:
+        # Generate response
+        inputs = hf_tokenizer(prompt, return_tensors="pt").to(hf_model.device)
+        outputs = hf_model.generate(
+            inputs.input_ids,
+            max_new_tokens=max_tokens,
+            temperature=temperature,
+            do_sample=True,
+            top_p=0.95,
+        )
+        
+        # Extract just the assistant's response
+        full_response = hf_tokenizer.decode(outputs[0], skip_special_tokens=True)
+        assistant_response = full_response.replace(prompt, "").strip()
+        
+        # Update history
+        history.append({"user": user_message, "assistant": assistant_response})
+        
+        return jsonify({
+            "response": assistant_response,
+            "conversation_id": conversation_id
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/mixtral/load', methods=['POST'])
+def load_mixtral():
+    """
+    API endpoint to explicitly load the model
+    """
+    try:
+        quantize = request.json.get('quantize', True)
+        # Use Falcon instead of Mixtral
+        success = load_falcon_model(quantize=quantize)
+        return jsonify({"message": "Falcon model loaded successfully", "quantized": quantize})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run the LLM API server")
-    parser.add_argument('--port', type=int, default=5000, help='Port to run the server on')
+    parser.add_argument('--port', type=int, default=8000, help='Port to run the server on')
     parser.add_argument('--model_path', type=str, help='Path to a trained model checkpoint')
     parser.add_argument('--model_type', type=str, help='Pretrained model type (e.g., gpt2, gpt2-medium)')
     parser.add_argument('--config_file', type=str, help='Configuration file for model settings')
