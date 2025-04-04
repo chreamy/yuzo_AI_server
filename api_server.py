@@ -93,7 +93,7 @@ def load_model(model_path=None, model_type=None):
 
 def load_falcon_model(quantize=True):
     """
-    Load Falcon model optimized for RTX 3080
+    Load Falcon model with 4-bit quantization for RTX 3080 Ti
     """
     global hf_model, hf_tokenizer
     
@@ -103,34 +103,45 @@ def load_falcon_model(quantize=True):
     # Load tokenizer
     hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Check for CUDA
-    if torch.cuda.is_available():
-        print(f"CUDA available: Using GPU {torch.cuda.get_device_name(0)}")
-        device_map = "auto"
-        
-        # Load model with 8-bit quantization for better VRAM usage
-        if quantize:
-            print("Loading with 8-bit quantization")
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map=device_map,
-                load_in_8bit=True,  # 8-bit quantization works well on RTX 3080
-                torch_dtype=torch.float16
-            )
-        else:
-            print("Loading without quantization (higher memory usage)")
-            hf_model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                device_map=device_map,
-                torch_dtype=torch.float16
-            )
-    else:
-        print("CUDA not available: Falling back to CPU (not recommended)")
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            device_map="cpu",
-            torch_dtype=torch.float32
-        )
+    # Configure 4-bit quantization
+    from transformers import BitsAndBytesConfig
+    
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,                # Use 4-bit precision
+        bnb_4bit_use_double_quant=True,   # Use double quantization
+        bnb_4bit_quant_type="nf4",        # Use normalized float 4
+        bnb_4bit_compute_dtype=torch.float16 # Compute in fp16
+    )
+    
+    # Load model with 4-bit quantization
+    print("Loading with 4-bit quantization")
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        quantization_config=bnb_config,
+        torch_dtype=torch.float16,
+        trust_remote_code=True
+    )
+    
+    print(f"{model_name} model loaded successfully")
+    return True
+
+def load_small_model():
+    """
+    Load a smaller model that fits on RTX 3080 Ti
+    """
+    global hf_model, hf_tokenizer
+    
+    # This model is only 3GB and works great on RTX 3080 Ti
+    model_name = "google/flan-t5-xl"
+    print(f"Loading smaller model: {model_name}")
+    
+    hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        torch_dtype=torch.float16
+    )
     
     print(f"{model_name} model loaded successfully")
     return True
@@ -397,18 +408,23 @@ def prepare_dataset():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/load_model', methods=['POST'])
-def api_load_model():
+@app.route('/api/model/load', methods=['POST'])
+def load_model_api():
     """
     API endpoint to load a specific model
     """
     data = request.json
-    model_path = data.get('model_path')
-    model_type = data.get('model_type')
+    model_name = data.get('model_name', 'falcon')  # 'falcon' or 'small'
     
     try:
-        load_model(model_path, model_type)
-        return jsonify({"message": "Model loaded successfully"})
+        if model_name == 'falcon':
+            success = load_falcon_model(quantize=True)
+            return jsonify({"message": "Falcon model loaded successfully"})
+        elif model_name == 'small':
+            success = load_small_model()
+            return jsonify({"message": "Small model loaded successfully"})
+        else:
+            return jsonify({"error": "Invalid model name"}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
