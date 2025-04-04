@@ -24,6 +24,13 @@ print(f"Using device: {device}")
 hf_model = None
 hf_tokenizer = None
 
+# Add this near the top of your script for debugging GPU detection
+print("CUDA Available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("CUDA Device Count:", torch.cuda.device_count())
+    print("CUDA Device Name:", torch.cuda.get_device_name(0))
+    print("CUDA Device Memory:", torch.cuda.get_device_properties(0).total_memory / 1e9, "GB")
+
 def load_model(model_path=None, model_type=None):
     """
     Load a model either from a checkpoint or use a pretrained GPT-2 model
@@ -86,7 +93,7 @@ def load_model(model_path=None, model_type=None):
 
 def load_falcon_model(quantize=True):
     """
-    Load Falcon model that doesn't require authentication
+    Load Falcon model optimized for RTX 3080
     """
     global hf_model, hf_tokenizer
     
@@ -96,13 +103,34 @@ def load_falcon_model(quantize=True):
     # Load tokenizer
     hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
     
-    # Load model with quantization
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        load_in_8bit=True if quantize else False,
-        torch_dtype=torch.float16,
-    )
+    # Check for CUDA
+    if torch.cuda.is_available():
+        print(f"CUDA available: Using GPU {torch.cuda.get_device_name(0)}")
+        device_map = "auto"
+        
+        # Load model with 8-bit quantization for better VRAM usage
+        if quantize:
+            print("Loading with 8-bit quantization")
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map=device_map,
+                load_in_8bit=True,  # 8-bit quantization works well on RTX 3080
+                torch_dtype=torch.float16
+            )
+        else:
+            print("Loading without quantization (higher memory usage)")
+            hf_model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                device_map=device_map,
+                torch_dtype=torch.float16
+            )
+    else:
+        print("CUDA not available: Falling back to CPU (not recommended)")
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            device_map="cpu",
+            torch_dtype=torch.float32
+        )
     
     print(f"{model_name} model loaded successfully")
     return True
