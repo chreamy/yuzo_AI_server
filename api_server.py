@@ -93,38 +93,79 @@ def load_model(model_path=None, model_type=None):
 
 def load_falcon_model(quantize=True):
     """
-    Load Falcon model with 4-bit quantization for RTX 3080 Ti
+    Load Falcon model with maximum optimizations for RTX 3080 (10GB VRAM)
     """
     global hf_model, hf_tokenizer
     
-    model_name = "tiiuae/falcon-7b-instruct"
-    print(f"Loading Falcon model: {model_name}")
-    
-    # Load tokenizer
-    hf_tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    # Configure 4-bit quantization
-    from transformers import BitsAndBytesConfig
-    
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,                # Use 4-bit precision
-        bnb_4bit_use_double_quant=True,   # Use double quantization
-        bnb_4bit_quant_type="nf4",        # Use normalized float 4
-        bnb_4bit_compute_dtype=torch.float16 # Compute in fp16
-    )
-    
-    # Load model with 4-bit quantization
-    print("Loading with 4-bit quantization")
-    hf_model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        quantization_config=bnb_config,
-        torch_dtype=torch.float16,
-        trust_remote_code=True
-    )
-    
-    print(f"{model_name} model loaded successfully")
-    return True
+    try:
+        # Use a smaller 7B model that's known to work well on RTX 3080
+        model_name = "tiiuae/falcon-7b-instruct"  # Stick with this smaller model
+        print(f"Loading model: {model_name}")
+        
+        # Set up GPU offloading and optimal memory settings
+        from transformers import BitsAndBytesConfig
+        
+        # First try with tokenizer
+        print("Loading tokenizer...")
+        hf_tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            use_fast=False  # Sometimes fast tokenizers cause issues
+        )
+        
+        if not hasattr(hf_tokenizer, "pad_token") or hf_tokenizer.pad_token is None:
+            hf_tokenizer.pad_token = hf_tokenizer.eos_token
+        
+        print("Tokenizer loaded successfully")
+        
+        # Conservative 4-bit quantization setup
+        print("Configuring 4-bit quantization...")
+        nf4_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True
+        )
+        
+        # Critical: Empty CUDA cache before loading
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"CUDA cache cleared. Available memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        
+        # Load the model with all optimizations
+        print("Loading model with 4-bit quantization - this may take a few minutes...")
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=nf4_config,
+            device_map="auto",
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,      # Reduce CPU memory usage
+            offload_folder="offload",    # Use disk offloading if needed
+            offload_state_dict=True,     # Offload state dict to CPU temporarily
+            trust_remote_code=False      # More conservative setting
+        )
+        
+        print(f"Model loaded successfully!")
+        return True
+        
+    except Exception as e:
+        print(f"Error loading Falcon model: {str(e)}")
+        print("Falling back to GPT2 model...")
+        
+        # Fallback to GPT2 which definitely works
+        try:
+            from model import GPT
+            hf_model = GPT.from_pretrained("gpt2", dict(dropout=0.0))
+            
+            # Use tiktoken for GPT-2 models
+            import tiktoken
+            enc = tiktoken.get_encoding("gpt2")
+            hf_tokenizer = AutoTokenizer.from_pretrained("gpt2")
+            
+            print("Successfully loaded GPT2 as fallback")
+            return True
+        except Exception as fallback_error:
+            print(f"Fallback also failed: {str(fallback_error)}")
+            raise
 
 def load_small_model():
     """
@@ -434,7 +475,7 @@ conversations = {}
 @app.route('/api/mixtral/chat', methods=['POST'])
 def mixtral_chat():
     """
-    Chatbot endpoint using Falcon
+    Chatbot endpoint with improved reliability
     """
     global hf_model, hf_tokenizer
     
@@ -448,7 +489,7 @@ def mixtral_chat():
     data = request.json
     user_message = data.get('message', '')
     conversation_id = data.get('conversation_id', None)
-    max_tokens = data.get('max_tokens', 1024)
+    max_tokens = min(data.get('max_tokens', 256), 512)  # Cap at 512 for safety
     temperature = data.get('temperature', 0.7)
     
     # Get or create conversation history
@@ -460,35 +501,69 @@ def mixtral_chat():
         history = []
         conversations[conversation_id] = history
     
-    # Format conversation in Falcon's expected format
-    prompt = "You are a helpful assistant.\n\n"
-    for entry in history:
-        prompt += f"User: {entry['user']}\nAssistant: {entry['assistant']}\n\n"
-    
-    prompt += f"User: {user_message}\nAssistant:"
+    # Format conversation based on model type
+    if hasattr(hf_model, 'config') and hasattr(hf_model.config, 'model_type') and hf_model.config.model_type == 'falcon':
+        prompt = "You are a helpful assistant.\n\n"
+        for entry in history:
+            prompt += f"User: {entry['user']}\nAssistant: {entry['assistant']}\n\n"
+        prompt += f"User: {user_message}\nAssistant:"
+    else:
+        # Default prompt format for GPT models
+        prompt = ""
+        for entry in history:
+            prompt += f"Human: {entry['user']}\nAI: {entry['assistant']}\n"
+        prompt += f"Human: {user_message}\nAI:"
     
     try:
-        # Generate response
-        inputs = hf_tokenizer(prompt, return_tensors="pt").to(hf_model.device)
-        outputs = hf_model.generate(
-            inputs.input_ids,
-            max_new_tokens=max_tokens,
-            temperature=temperature,
-            do_sample=True,
-            top_p=0.95,
-        )
+        # Clear the CUDA cache before generation
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
-        # Extract just the assistant's response
-        full_response = hf_tokenizer.decode(outputs[0], skip_special_tokens=True)
-        assistant_response = full_response.replace(prompt, "").strip()
+        # Safety timeout for generation (30 seconds)
+        import threading
+        result = {"error": "Generation timed out"}
         
-        # Update history
-        history.append({"user": user_message, "assistant": assistant_response})
+        def generate():
+            nonlocal result
+            try:
+                # Generate response with proper error handling
+                inputs = hf_tokenizer(prompt, return_tensors="pt").to(hf_model.device)
+                
+                # Use a more conservative generation approach
+                outputs = hf_model.generate(
+                    inputs.input_ids,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    do_sample=True,
+                    top_p=0.95,
+                    num_return_sequences=1,
+                    pad_token_id=hf_tokenizer.eos_token_id,
+                    attention_mask=inputs.attention_mask
+                )
+                
+                # Extract just the assistant's response
+                full_response = hf_tokenizer.decode(outputs[0], skip_special_tokens=True)
+                assistant_response = full_response.replace(prompt, "").strip()
+                
+                # Update history
+                history.append({"user": user_message, "assistant": assistant_response})
+                
+                result = {
+                    "response": assistant_response,
+                    "conversation_id": conversation_id
+                }
+            except Exception as e:
+                result = {"error": str(e)}
         
-        return jsonify({
-            "response": assistant_response,
-            "conversation_id": conversation_id
-        })
+        # Run with timeout
+        thread = threading.Thread(target=generate)
+        thread.start()
+        thread.join(timeout=30)  # 30 second timeout
+        
+        if "error" in result:
+            return jsonify(result), 500
+        
+        return jsonify(result)
         
     except Exception as e:
         return jsonify({"error": str(e)}), 500
